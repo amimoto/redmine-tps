@@ -1,0 +1,490 @@
+#!/usr/bin/perl
+
+use strict;
+use vars qw/ $CFG $CACHE $TEMPLATES /;
+use Getopt::Std;
+use JSON;
+use HTTP::Request::Common qw(POST);
+use Digest::MD5;
+use LWP::UserAgent;
+use Data::Dumper;
+use Date::Manip;
+use constant {
+        ISU_ID       => 0,
+        ISU_SUBJECT  => 1,
+        ISU_PRJ_ID   => 2,
+        ISU_DUE_DATE => 3,
+        ISU_PRIORITY => 4,
+
+        LOG_ID       => 0,
+        LOG_PRJ_ID   => 1,
+        LOG_ISU_ID   => 2,
+        LOG_SUBJECT  => 3,
+        LOG_HOURS    => 4,
+        LOG_COMMENTS => 5,
+    };
+$|++;
+
+$CFG = {
+    server_url => 'http://localhost/projects/redmine/server/cgi-bin/json.cgi',
+    data_path  => "$ENV{HOME}/.tpsreport",
+    editor     => $ENV{EDITOR}||`which vim`,
+    temp_path  => "/tmp",
+};
+
+$CFG->{editor} =~ s/\n|\r//g;
+
+$TEMPLATES = {
+    logadd     => <<'LOGADD',
+project_id: %project_id%
+issue_id: %issue_id%
+hours: %hours%
+comments: %comments%
+activity_id: %activity_id%
+spent_on: %spent_on%
+
+=== [ Anything below this line will be ignored ] ===
+
+%additional_data%
+LOGADD
+
+};
+
+main();
+
+sub main {
+# --------------------------------------------------
+# Main loop/entry point/multiplexer/etc
+#
+
+# Basic init
+    my $opts = {};
+    getopts( 'lh:u:p:sad:p:i:c:a:r:', $opts );
+#    if( $opts->{h} or not keys %$opts ) { return HELP_MESSAGE() }
+    init();
+
+# Now handle actions
+    $opts->{l} and do_login($opts);
+    $opts->{a} and do_logadd($opts);
+    $opts->{r} and do_logremove($opts);
+    $opts->{s} and do_stats($opts);
+
+# Shutdown code
+    cache_store();
+}
+
+sub init {
+# --------------------------------------------------
+# Init all requisite parameters as required
+#
+
+# Create the home directory
+    my $data_path = $CFG->{data_path};
+    unless ( -d $data_path ) {
+        mkdir $data_path, 0700 or die "Could not create data path '$data_path'";
+    }
+    cache_load();
+}
+
+sub do_login {
+# --------------------------------------------------
+# Log the user into the system if required
+#
+    my ( $opts ) = @_;
+    unless ( $opts->{u} and $opts->{p} ) {
+        die "Require username and password (see: -u, -p)"
+    }
+
+# Let's see if the user can login
+    my $resp = server_rpc(
+        'login', {
+            login => $opts->{u},
+            pass  => $opts->{p}
+        },
+    );
+    $resp->{success} or die "$resp->{error}\n";
+
+# Sweet! Get the session ID and store 'er
+    my $data = $resp->{data};
+    $CACHE->{session_id} = $data->{session_id};
+    $CACHE->{session} = $resp;
+    cache_store();
+
+# Now let's display the user's stats
+    print display_user( $data->{user} );
+    print display_issues($data->{issues},$data->{projects});
+    print display_schedule($data->{schedule},$data->{projects});
+    print display_logged($data->{time_log},$data->{projects});
+}
+
+sub do_logadd {
+# --------------------------------------------------
+    my ( $opts ) = @_;
+
+# Let's see if the user can get stats
+    my $resp = server_rpc(
+        'stats', {
+            session_id => $CACHE->{session_id}
+        },
+    );
+    $resp->{success} or die "$resp->{error}\n";
+
+# Now let's see about creating some useful data
+    my $data = $resp->{data};
+    my $projects = $data->{projects};
+
+# Get the preset values
+    my $project_id  = $opts->{p} || '';
+    my $issue_id    = $opts->{i} || '';
+    my $hours       = $opts->{h} || '';
+    my $comments    = $opts->{c} || '';
+    my $activity_id = $opts->{a} || '';
+    my $date        = $opts->{d} ? ParseDate($opts->{d}) : ParseDate( "epoch ".time);
+    my $date_str    = UnixDate( $date, '%Y-%m-%d' );
+
+
+# So let's do inferring
+
+# Handle the issue if required 
+    unless ( $issue_id =~ s/^(\d+)(\s*:.*)$/$1/ ) {
+        my $issues = $data->{issues};
+        for my $issue (@$issues) {
+            my $isu_subject = $issue->[ISU_SUBJECT];
+            next unless $isu_subject =~ /$issue_id/i;
+            $issue_id = $issue->[ISU_ID];;
+            last;
+        }
+    }
+    if ( $issue_id ) {
+        for (@{$data->{issues}}) {
+            next unless $_->[ISU_ID] == $issue_id;
+            $issue_id = sprintf "%s: %s", $issue_id, $_->[ISU_SUBJECT];
+            $project_id = $_->[ISU_PRJ_ID];
+        }
+    }
+
+# Handle the project_id
+    my $issue_projects = {};
+    for my $issue ( @{$data->{issues}} ) {
+        $issue_projects->{$issue->[ISU_PRJ_ID]}++;
+    }
+
+# ... is the project id a phrase? we'll see if we can match one
+    unless ( $project_id =~ s/^(\d+)(\s+-.*)$/$1/ ) {
+        for my $prj_id (keys %$issue_projects, keys %$projects) {
+            my $prj_name = $projects->{$prj_id};
+            next unless $prj_name =~ /$project_id/i;
+            $project_id = $prj_id;
+            last;
+        }
+    }
+
+# ... No project ID? let's try and force it
+    if ( not $project_id and keys %$issue_projects == 1 ) {
+        ( $project_id ) = keys %$issue_projects;
+    };
+
+# ... and populate the name if required
+    if ( $project_id ) {
+        $project_id = sprintf "%s: %s", $project_id, $projects->{$project_id};
+    }
+
+
+# Now let's create the editor frame
+    my $buf  = '';
+       $buf .= display_projects($projects) unless $project_id;
+       $buf .= display_issues($data->{issues},$projects) unless $issue_id;
+       $buf .= display_schedule($data->{schedule},$projects);
+       $buf .= display_logged($data->{time_log},$projects);
+    my $tags = {
+        project_id      => $project_id,
+        issue_id        => $issue_id,
+        hours           => $hours,
+        comments        => $comments,
+        activity_id     => $activity_id,
+        spent_on        => $date_str,
+        additional_data => $buf,
+    };
+
+# If no hours have been defined for time used, we'll just 
+# send the user into the editor
+    while ( not $hours ) {
+        my $log_buf = template_parse(logadd=>$tags);
+        my $temp_fpath = temp_fpath();
+        barf($temp_fpath,$log_buf);
+        system $CFG->{editor}, $temp_fpath and die "Could not launch editor: $!";
+        my $log_buf_new = gulp($temp_fpath);
+        $log_buf_new =~ s,===\s+.*,,gs;
+        for my $l ( split /\n|\r/, $log_buf_new ) {
+            next if $l =~ /^\s*$/;
+            if ( $l =~ /^\s*comments:\s*(.*)/ ) {
+                $tags->{comments} = $1;
+            }
+            elsif ( $l =~ /^\s*([\w-]+)\s*:\s*(.*)/ ) {
+                $tags->{$1} = $2;
+            }
+        }
+
+        if ( $tags->{hours} ) {
+            last;
+        }
+
+        print "You have not specified the number of hours to commit. Please correct or Ctrl-C to exit:\n";
+        <STDIN>;
+    };
+
+# Now put everything together, wheee!
+    for (qw(
+        project_id
+        issue_id
+        hours
+        activity_id
+        spent_on
+    )) {
+        $tags->{$_} =~ s/:.*$//g;
+    }
+    delete $tags->{additional_data};
+
+# Send off the request to the redmine server nao
+    my $resp = server_rpc(
+        'logadd', {
+            session_id => $CACHE->{session_id},
+            %$tags
+        },
+    );
+    $resp->{success} or die "Ooops: $resp->{error}\n";
+
+warn Dumper $resp;
+}
+
+sub do_logremove {
+# --------------------------------------------------
+    my ( $opts ) = @_;
+}
+
+sub do_stats {
+# --------------------------------------------------
+    my ( $opts ) = @_;
+
+# Let's see if the user can get stats
+    my $resp = server_rpc(
+        'stats', {
+            session_id => $CACHE->{session_id}
+        },
+    );
+    $resp->{success} or die "$resp->{error}\n";
+
+# Now let's display the user's stats
+    my $data = $resp->{data};
+    print display_user( $data->{user} );
+    print display_issues($data->{issues},$data->{projects});
+    print display_schedule($data->{schedule},$data->{projects});
+    print display_logged($data->{time_log},$data->{projects});
+}
+
+sub display_user {
+# --------------------------------------------------
+# Display the user information
+#
+    my ( $user ) = @_;
+    return "";
+}
+
+sub display_projects {
+# --------------------------------------------------
+# Return a buffer holding all the projects a user
+# belongs
+#
+    my ( $projects ) = @_;
+    my $buf = "PROJECTS:\n--------------------------\n";
+    for my $project_id ( 
+                sort {
+                    $projects->{$a} cmp $projects->{$b}
+                } 
+                keys %$projects 
+            ) {
+        $buf .= sprintf " %5s: %s\n", $project_id, $projects->{$project_id};
+    }
+    $buf .= "\n";
+    return $buf;
+}
+
+sub display_issues {
+# --------------------------------------------------
+# return buffer with a list of open issues
+#
+    my ( $issues, $projects ) = @_;
+    my $buf = "ISSUES:\n--------------------------\n";
+    for my $issue (@$issues) {
+        if ( $issue->[3] ) { # if due date
+            $buf .= sprintf " %5s:%s:%-10s %s (Due: %s)\n", $issue->[0], $projects->{$issue->[2]}, $issue->[4], $issue->[1], $issue->[3];
+        }
+        else {
+            $buf .= sprintf " %5s:%s:%-10s %s\n", $issue->[0], $projects->{$issue->[2]}, $issue->[4], $issue->[1];
+        }
+    }
+    $buf .= "\n";
+    return $buf;
+}
+
+sub display_schedule {
+# --------------------------------------------------
+# return buffer with today's schedule
+#
+    my ( $schedule, $projects ) = @_;
+    my $buf = "SCHEDULE:\n--------------------------\n";
+    for my $schedule ( @$schedule ) {
+        $buf .= sprintf " %s: %sh\n", $projects->{$schedule->[0]}, $schedule->[1];
+    }
+    $buf .= "\n";
+    return $buf;
+}
+
+sub display_logged {
+# --------------------------------------------------
+# Display the current logged values
+#
+    my ( $logged, $projects ) = @_;
+    my $buf = "LOGGED:\n--------------------------\n";
+    my $hours = 0;
+    for my $log ( @$logged ) {
+        $buf .= sprintf " %s: %s: %sh\n", 
+                    $log->[LOG_ID],
+                    $log->[LOG_COMMENTS]||$log->[LOG_SUBJECT],
+                    $log->[LOG_HOURS];
+        $hours += $log->[LOG_HOURS];
+    }
+    $buf .= "  Total Hours Logged: ${hours}h\n";
+    $buf .= "\n";
+    return $buf;
+}
+
+sub temp_fpath {
+# --------------------------------------------------
+# Returns a unique temp filename
+#
+    my $fpath;
+    do {
+        $fpath = $CFG->{temp_path} . "/" . Digest::MD5::md5_hex( time*$$*rand(100_000));
+    } while ( -f $fpath );
+    return $fpath;
+}
+
+sub template_parse {
+# --------------------------------------------------
+# Returns the result of a parsed template
+#
+    my ( $template, $vars ) = @_;
+    my $template_buf = $TEMPLATES->{$template};
+    $vars ||= {};
+    $template_buf =~ s/%(\w+)%/$vars->{$+}/ge;
+    $template_buf =~ s/%%/%/g;
+    return $template_buf;
+}
+
+sub cache_load {
+# --------------------------------------------------
+# Load the cached auth file if available
+#
+    CACHE_LOAD: {
+        my $data_path = $CFG->{data_path};
+        last CACHE_LOAD unless -d $data_path;
+        my $cache_fpath = "$data_path/cache";
+        last CACHE_LOAD unless -f $cache_fpath;
+        my $cache_buf = gulp($cache_fpath) or last CACHE_LOAD;
+        $CACHE = eval { from_json($cache_buf) };
+    };
+    unless ($CACHE) {
+        $CACHE = {};
+    }
+
+    return $CACHE;
+}
+
+sub cache_store {
+# --------------------------------------------------
+# Stores the current contents of the cache
+#
+    my $data_path = $CFG->{data_path};
+    return unless -d $data_path;
+    my $cache_fpath = "$data_path/cache";
+    my $cache_buf = to_json($CACHE);
+    return barf( $cache_fpath => $cache_buf );
+}
+
+sub server_rpc {
+# --------------------------------------------------
+# Sends a request to the server and parses the 
+# response
+#
+    my ( $do => $request ) = @_;
+    $request ||= {};
+    $request->{do} = $do;
+    my $ua = LWP::UserAgent->new;
+    my $req = POST $CFG->{server_url}, [%$request];
+    my $resp = $ua->request($req)->content;
+    my $data = eval { from_json($resp) } || { error => "$@/$resp" };
+    return $data;
+}
+
+sub gulp {
+# --------------------------------------------------
+# Load the content of a file in one go. Bad for
+# big files!
+#
+    my $fpath = shift;
+    return unless -f $fpath;
+    open my $fh, "<$fpath" or return;
+    local $/;
+    my $buf = <$fh>;
+    close $fh;
+    return $buf;
+
+}
+
+sub barf {
+# --------------------------------------------------
+# Dump the contents of a buffer into a file in one
+# swoop.
+#
+    my ( $fpath, $buf ) = @_;
+    open my $fh, ">$fpath" or return;
+    print $fh $buf;
+    close $fh;
+    return 1;
+}
+
+sub HELP_MESSAGE {
+# --------------------------------------------------
+    print q`
+NAME
+    $0 - Command line interface to the Redmine Time Progress System (TPS)
+
+SYNOPSIS
+    $0 [OPTIONS]
+
+OPTIONS
+
+  Actions
+
+    -l           Login
+
+    -s           Stats - Display issues, schedule, timelog
+
+    -a           Add a new TPS log entry
+    -r ID        Remove a TPS log entry
+
+  Metadata
+
+    -u           Username 
+    -p           Password
+
+    -p           Project ID or Name
+    -i           Issue ID or Name
+    -h           Hours spent
+    -c           Comments
+    -a           Activity
+    -d           Date (see Date::Manip for flexibility)
+
+`;
+}
