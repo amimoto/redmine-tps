@@ -22,11 +22,14 @@ use constant {
         LOG_SUBJECT  => 3,
         LOG_HOURS    => 4,
         LOG_COMMENTS => 5,
+
+        ACT_ID       => 0,
+        ACT_NAME     => 1,
     };
 $|++;
 
 $CFG = {
-    server_url => 'http://localhost/projects/redmine/server/cgi-bin/json.cgi',
+    server_url => 'http://localhost/projects/redmine-tps/server/cgi-bin/json.cgi',
     data_path  => "$ENV{HOME}/.tpsreport",
     editor     => $ENV{EDITOR}||`which vim`,
     temp_path  => "/tmp",
@@ -59,8 +62,8 @@ sub main {
 
 # Basic init
     my $opts = {};
-    getopts( 'lh:u:p:sad:p:i:c:a:r:', $opts );
-#    if( $opts->{h} or not keys %$opts ) { return HELP_MESSAGE() }
+    getopts( 'lh:u:p:sad:p:i:c:t:r:', $opts );
+    if( not keys %$opts ) { return HELP_MESSAGE() }
     init();
 
 # Now handle actions
@@ -122,11 +125,7 @@ sub do_logadd {
     my ( $opts ) = @_;
 
 # Let's see if the user can get stats
-    my $resp = server_rpc(
-        'stats', {
-            session_id => $CACHE->{session_id}
-        },
-    );
+    my $resp = server_rpc('stats');
     $resp->{success} or die "$resp->{error}\n";
 
 # Now let's see about creating some useful data
@@ -138,7 +137,7 @@ sub do_logadd {
     my $issue_id    = $opts->{i} || '';
     my $hours       = $opts->{h} || '';
     my $comments    = $opts->{c} || '';
-    my $activity_id = $opts->{a} || '';
+    my $activity_id = $opts->{t} || '';
     my $date        = $opts->{d} ? ParseDate($opts->{d}) : ParseDate( "epoch ".time);
     my $date_str    = UnixDate( $date, '%Y-%m-%d' );
 
@@ -189,11 +188,29 @@ sub do_logadd {
         $project_id = sprintf "%s: %s", $project_id, $projects->{$project_id};
     }
 
+# Handle the activity ID
+    unless ( $activity_id =~ s/^(\d+)(\s+-.*)$/$1/ ) {
+        for my $act (@{$data->{activities}}) {
+            my $act_name = $act->[ACT_NAME];
+            next unless $act_name =~ /$activity_id/i;
+            $activity_id = $act->[ACT_ID];
+            last;
+        }
+    }
+    if ( $activity_id ) {
+        for (@{$data->{activities}}) {
+            next unless $_->[ACT_ID] == $activity_id;
+            $activity_id = sprintf "%s: %s", $activity_id, $_->[ACT_NAME];
+        }
+    }
+
+
 
 # Now let's create the editor frame
     my $buf  = '';
        $buf .= display_projects($projects) unless $project_id;
        $buf .= display_issues($data->{issues},$projects) unless $issue_id;
+       $buf .= display_activities($data->{activities}) unless $activity_id;
        $buf .= display_schedule($data->{schedule},$projects);
        $buf .= display_logged($data->{time_log},$projects);
     my $tags = {
@@ -208,7 +225,7 @@ sub do_logadd {
 
 # If no hours have been defined for time used, we'll just 
 # send the user into the editor
-    while ( not $hours ) {
+    while ( not ( $hours and ( $comments or $issue_id ) ) ) {
         my $log_buf = template_parse(logadd=>$tags);
         my $temp_fpath = temp_fpath();
         barf($temp_fpath,$log_buf);
@@ -225,11 +242,13 @@ sub do_logadd {
             }
         }
 
-        if ( $tags->{hours} ) {
+# Ensure we have the prerequisites before continuing
+        if ( $tags->{hours} and ( $tags->{comments} or $tags->{project_id} ) ) {
             last;
         }
 
-        print "You have not specified the number of hours to commit. Please correct or Ctrl-C to exit:\n";
+        ( $tags->{comments} or $tags->{project_id} ) or print "You have not specified the project ID or a comment to commit. Please correct or Ctrl-C to exit:\n";
+        $tags->{hours} or print "You have not specified the number of hours to commit. Please correct or Ctrl-C to exit:\n";
         <STDIN>;
     };
 
@@ -246,20 +265,22 @@ sub do_logadd {
     delete $tags->{additional_data};
 
 # Send off the request to the redmine server nao
-    my $resp = server_rpc(
-        'logadd', {
-            session_id => $CACHE->{session_id},
-            %$tags
-        },
-    );
+    my $resp = server_rpc('logadd',$tags);
     $resp->{success} or die "Ooops: $resp->{error}\n";
-
-warn Dumper $resp;
 }
 
 sub do_logremove {
 # --------------------------------------------------
     my ( $opts ) = @_;
+    my $log_id = int $opts->{r} or die "Require a log_id. Check with '$0 -s' ?";
+
+# Let's see if the user can login
+    my $resp = server_rpc(
+        'logremove', {
+            log_id => $log_id
+        },
+    );
+    $resp->{success} or die "$resp->{error}\n";
 }
 
 sub do_stats {
@@ -267,11 +288,7 @@ sub do_stats {
     my ( $opts ) = @_;
 
 # Let's see if the user can get stats
-    my $resp = server_rpc(
-        'stats', {
-            session_id => $CACHE->{session_id}
-        },
-    );
+    my $resp = server_rpc('stats');
     $resp->{success} or die "$resp->{error}\n";
 
 # Now let's display the user's stats
@@ -334,7 +351,7 @@ sub display_schedule {
     my ( $schedule, $projects ) = @_;
     my $buf = "SCHEDULE:\n--------------------------\n";
     for my $schedule ( @$schedule ) {
-        $buf .= sprintf " %s: %sh\n", $projects->{$schedule->[0]}, $schedule->[1];
+        $buf .= sprintf "  %s: %sh\n", $projects->{$schedule->[0]}, $schedule->[1];
     }
     $buf .= "\n";
     return $buf;
@@ -348,13 +365,29 @@ sub display_logged {
     my $buf = "LOGGED:\n--------------------------\n";
     my $hours = 0;
     for my $log ( @$logged ) {
-        $buf .= sprintf " %s: %s: %sh\n", 
+        $buf .= sprintf " %5s: %s: %sh\n", 
                     $log->[LOG_ID],
                     $log->[LOG_COMMENTS]||$log->[LOG_SUBJECT],
                     $log->[LOG_HOURS];
         $hours += $log->[LOG_HOURS];
     }
     $buf .= "  Total Hours Logged: ${hours}h\n";
+    $buf .= "\n";
+    return $buf;
+}
+
+sub display_activities {
+# --------------------------------------------------
+# Create a buffer that displays what time entry activities
+# are available to the user for use.
+#
+    my ( $activities ) = @_;
+    my $buf = "ACTIVITIES:\n--------------------------\n";
+    for my $act ( @$activities ) {
+        $buf .= sprintf " %3s: %s\n",
+                    $act->[ACT_ID],
+                    $act->[ACT_NAME];
+    }
     $buf .= "\n";
     return $buf;
 }
@@ -420,6 +453,7 @@ sub server_rpc {
     my ( $do => $request ) = @_;
     $request ||= {};
     $request->{do} = $do;
+    $request->{session_id} = $CACHE->{session_id};
     my $ua = LWP::UserAgent->new;
     my $req = POST $CFG->{server_url}, [%$request];
     my $resp = $ua->request($req)->content;
@@ -483,7 +517,7 @@ OPTIONS
     -i           Issue ID or Name
     -h           Hours spent
     -c           Comments
-    -a           Activity
+    -t           Activity
     -d           Date (see Date::Manip for flexibility)
 
 `;

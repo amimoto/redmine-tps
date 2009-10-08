@@ -221,17 +221,18 @@ sub do_logadd {
     return R_SUCCESS($result);
 }
 
-sub do_logdel {
+sub do_logremove {
 # --------------------------------------------------
 # Remove a log entry from the data for the user
 #
-    my ( $args ) = @_;
+    my ( $args )   = @_;
     my $session_id = $args->{session_id}    or return R_ERROR('No session ID found');
-    my $session   = session_load($session_id) or return R_ERROR('No session found');
-    my $log_id    = $args->{id} or return R_ERROR('No Log ID provided');
-    my $log_entry = $DB->selectrow_hashref("select * from time_entries where id = ?",{},$log_id) or return R_ERROR("No log by that ID");
+    my $session    = session_load($session_id) or return R_ERROR('No session found');
+    my $log_id     = $args->{log_id} or return R_ERROR('No Log ID provided');
+    my $log_entry  = $DB->selectrow_hashref("select * from time_entries where id = ?",{},$log_id) or return R_ERROR("No log entry by that ID");
     $log_entry->{user_id} == $session->{data}{user}{id} or return R_ERROR("Not your entry!");
-    my $result = $DB->selectrow_hashref("delete from time_entries where id=?",{},$log_id) or return R_ERROR('No record deleted');
+    my $del_sth    = $DB->prepare("delete from time_entries where id=?") or return R_ERROR("Delete query prepare failed");
+    my $result     = $del_sth->execute($log_id) or return R_ERROR("Could not delete the record. Execute returned error");
     return R_SUCCESS($log_entry);
 }
 
@@ -259,11 +260,15 @@ sub do_stats {
 # 4. and find out how much time the user has already put forward
     my $time_log = db_time_log( $user, $tics );
 
+# 5. the activities that are available to the user
+    my $activities = db_activities();
+
     my $result = {
         issues     => $issues,
         projects   => $projects,
         schedule   => $schedule,
         time_log   => $time_log,
+        activities => $activities,
     };
 
     R_SUCCESS($result);
@@ -355,6 +360,20 @@ sub db_time_log {
                             ") or die $DB->errstr;
 
     return $time_log;
+}
+
+sub db_activities {
+# --------------------------------------------------
+# Return a list of all the activities that a log
+# entry can hold
+#
+    my $activities = $DB->selectall_arrayref("
+                            select id, name 
+                            from enumerations
+                            where type = 'TimeEntryActivity'
+                            order by position
+                        ") or die $DB->error;
+    return $activities;
 }
 
 sub session_create {
