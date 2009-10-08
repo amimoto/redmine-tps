@@ -350,9 +350,12 @@ sub display_schedule {
 #
     my ( $schedule, $projects ) = @_;
     my $buf = "SCHEDULE:\n--------------------------\n";
+    my $hours = 0;
     for my $schedule ( @$schedule ) {
         $buf .= sprintf "  %s: %sh\n", $projects->{$schedule->[0]}, $schedule->[1];
+        $hours += $schedule->[1];
     }
+    $buf .= "  Total Hours Scheduled: ${hours}h\n";
     $buf .= "\n";
     return $buf;
 }
